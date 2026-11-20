@@ -18,7 +18,7 @@ This is the rule text from `zone-canon-v0.json`:
 >
 > digest is lowercase hex sha256 of the canonical bytes.
 
-A scale such as 0.2 is then stored as an integer over a power of two, for example `{"scale_den_log2":10,"scales_num":{"corpus":205}}`. Integers print the same way in every language.
+A scale is then stored as an integer over a power of two, for example `{"scale_den_log2":10,"scales_num":{"corpus":205}}` for 205/1024. Integers print the same way in every language. The rule does not say how a decimal scale is rounded to such a fraction. That choice belongs to the layer that applies the scale.
 
 ## What is in the folder
 
