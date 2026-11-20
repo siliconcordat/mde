@@ -38,6 +38,7 @@ Standard MCP servers dump large tool lists and prose rules into prompts on every
 - `PLAN.md`: Implementation milestones, conformance gates, and explicit deferrals.
 - `schemas/zone-manifest.v0.1.json`: Canonical SHA-256 Vertical Zone Manifest mapping languages and CST nodes to zones, protection flags, and default Layer 2 scale hints.
 - `docs/BENCHMARKS.md`: Reproducible latency measurements and real-corpus conformance pass rates.
+- `docs/contextual-compute.md`: Proposed note. A closed tool is absent from the session offer. The zone manifest is unchanged.
 - `Cargo.toml`, `src/`, `tests/`, `examples/`: Rust `mde` CLI binary, stdio JSON-RPC MCP server, Tree-sitter CST engine, native guard, and automated conformance tests.
 
 ## Quickstart
