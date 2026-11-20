@@ -1,0 +1,97 @@
+{
+ "schema": "zone-canon-vectors/v0",
+ "rule": "Parse strictly. Objects sorted by key in code point order. No whitespace. Strings in raw UTF-8, escaping only quote, backslash and code points below 0x20 (short forms for b f n r t, otherwise lowercase \\u00xx). Numbers are integers with absolute value at most 2^53-1, written in decimal with no sign for zero, no leading zeros, no fraction or exponent. Any other number, any duplicate key, NaN and Infinity are rejected. digest is lowercase hex sha256 of the canonical bytes.",
+ "accept": [
+  {
+   "name": "empty_object",
+   "input": "{}",
+   "canonical": "{}",
+   "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  },
+  {
+   "name": "key_order_nested",
+   "input": "{\"b\":[1,{\"z\":true,\"a\":null}],\"a\":\"x\"}",
+   "canonical": "{\"a\":\"x\",\"b\":[1,{\"a\":null,\"z\":true}]}",
+   "sha256": "96c83c1cb81829f839e9b502d34eba2f7af11c7e11fd8d82237d49873cbbe110"
+  },
+  {
+   "name": "non_ascii_raw_utf8",
+   "input": "{\"é\":\"日本\",\"a\":\"\\u00e9\"}",
+   "canonical": "{\"a\":\"é\",\"é\":\"日本\"}",
+   "sha256": "f15a8b198ffb5b295dcf905075fc46543ac327dafdb37de84d819ccd4fd1c66c"
+  },
+  {
+   "name": "astral_key_sorts_after_ffff",
+   "input": "{\"\\ud83d\\ude00\":1,\"\\uffff\":2}",
+   "canonical": "{\"￿\":2,\"😀\":1}",
+   "sha256": "92db27167c6f89fc43ff6c1997a7954a2e5bec81936fbe5ee12b4b6615b09596"
+  },
+  {
+   "name": "control_chars_escaped",
+   "input": "{\"k\":\"a\\u0001b\\n\\u007f\"}",
+   "canonical": "{\"k\":\"a\\u0001b\\n\"}",
+   "sha256": "74713a64bb9f1fc65c596326c6ecdc32ad30f0ead0bde4c090cb4dc39809a42e"
+  },
+  {
+   "name": "max_safe_integer",
+   "input": "{\"n\":9007199254740991,\"m\":-9007199254740991}",
+   "canonical": "{\"m\":-9007199254740991,\"n\":9007199254740991}",
+   "sha256": "3f54c80abdfbc38f08ed5654622eea6e7d7e58cbac36cf5a0670c8aeb054703d"
+  },
+  {
+   "name": "scale_as_integer_over_1024",
+   "input": "{\"scale_den_log2\":10,\"scales_num\":{\"corpus\":205,\"weft-eido\":1024}}",
+   "canonical": "{\"scale_den_log2\":10,\"scales_num\":{\"corpus\":205,\"weft-eido\":1024}}",
+   "sha256": "e4e6e651a0b26c4d259173081cfcd990c191060167431003334412ec9985c333"
+  }
+ ],
+ "reject": [
+  {
+   "name": "float_small_0.00001",
+   "input": "{\"s\":0.00001}"
+  },
+  {
+   "name": "float_small_1e-05",
+   "input": "{\"s\":1e-05}"
+  },
+  {
+   "name": "float_1e16",
+   "input": "{\"s\":1e16}"
+  },
+  {
+   "name": "float_1e+16",
+   "input": "{\"s\":1e+16}"
+  },
+  {
+   "name": "float_zero_point_zero",
+   "input": "{\"s\":0.0}"
+  },
+  {
+   "name": "negative_zero",
+   "input": "{\"s\":-0}"
+  },
+  {
+   "name": "integer_2_pow_53",
+   "input": "{\"n\":9007199254740992}"
+  },
+  {
+   "name": "integer_above_u64",
+   "input": "{\"n\":18446744073709551616}"
+  },
+  {
+   "name": "duplicate_key",
+   "input": "{\"a\":1,\"a\":2}"
+  },
+  {
+   "name": "nan_token",
+   "input": "{\"n\":NaN}"
+  }
+ ],
+ "observed_today_not_a_rule": {
+  "note": "zone-manifest/v0.1 body with one scale set to 0.00001. Both digests are real outputs of the shipped code; the layers disagree.",
+  "python_warp_and_exo_bytes_fragment": "\"corpus\":1e-05",
+  "rust_mde_bytes_fragment": "\"corpus\":0.00001",
+  "python_digest": "sha256:5fdd6fa5d59947b5ad6d201d75b949540ee521152972b575d80464bd33f2e39c",
+  "rust_digest": "sha256:85bdbadfdcf7b3251154587a576d71b43479d00986b43ada5afbcb448ecf3951"
+ }
+}
