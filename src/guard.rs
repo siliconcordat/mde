@@ -530,7 +530,9 @@ pub fn audit_code_paths(paths: &[String]) -> MdeResult<GuardReport> {
 fn collect_auditable_files(dir: &Path, out: &mut Vec<String>) -> MdeResult<()> {
     let entries = fs::read_dir(dir)
         .map_err(|e| MdeError::new("ERR_IO", format!("read_dir failed: {e}")))?;
-    for entry in entries.flatten() {
+    for entry_res in entries {
+        let entry = entry_res
+            .map_err(|e| MdeError::new("ERR_IO", format!("read_dir entry failed: {e}")))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if matches!(
             name.as_str(),
@@ -539,9 +541,12 @@ fn collect_auditable_files(dir: &Path, out: &mut Vec<String>) -> MdeResult<()> {
             continue;
         }
         let path = entry.path();
-        if path.is_dir() {
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| MdeError::new("ERR_IO", format!("metadata failed: {e}")))?;
+        let ft = meta.file_type();
+        if ft.is_dir() {
             collect_auditable_files(&path, out)?;
-        } else if path.is_file() {
+        } else if ft.is_file() {
             let ext = path
                 .extension()
                 .and_then(|s| s.to_str())
@@ -647,7 +652,7 @@ fn is_silent_swallow_block(block: Node) -> bool {
     saw_stmt
 }
 
-/// Maximum JSON container nesting depth permitted by `JsonDupParser` (matching serde_json).
+/// Maximum JSON container nesting depth permitted by `JsonDupParser` (128 nested containers; rejects depth >= 129).
 pub const MAX_JSON_DUP_DEPTH: usize = 128;
 
 /// Strict recursive-descent JSON parser checking for duplicate object keys at any nesting depth.

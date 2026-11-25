@@ -21,10 +21,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+static TMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenRecord {
@@ -40,7 +44,16 @@ struct TokenStore {
     session_nonce: String,
     tokens: BTreeMap<String, TokenRecord>,
     #[serde(default)]
+    evals_by_packet: BTreeMap<String, u64>,
+    #[serde(default)]
+    store_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PacketEvalRecord {
+    packet_id: String,
     evals_used: u64,
+    record_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,7 +167,7 @@ pub struct Broker {
     repo_root: PathBuf,
     tokens: TokenStore,
     persist_tokens: bool,
-    evals_used: AtomicU64,
+    evals_by_packet: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Broker {
@@ -166,16 +179,16 @@ impl Broker {
             )
         })?;
         let tokens = if persist_tokens {
-            load_token_store(&root).unwrap_or_else(new_token_store)
+            load_token_store(&root)?.unwrap_or_else(new_token_store)
         } else {
             new_token_store()
         };
-        let evals_used = AtomicU64::new(tokens.evals_used);
+        let evals_by_packet = Mutex::new(tokens.evals_by_packet.clone());
         Ok(Self {
             repo_root: root,
             tokens,
             persist_tokens,
-            evals_used,
+            evals_by_packet,
         })
     }
 
@@ -184,10 +197,30 @@ impl Broker {
     }
 
     pub fn evals_used(&self) -> u64 {
-        self.evals_used.load(Ordering::SeqCst)
+        let guard = self
+            .evals_by_packet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.values().copied().fold(0u64, u64::saturating_add)
+    }
+
+    pub fn packet_evals_used(&self, packet_id: &str) -> u64 {
+        let guard = self
+            .evals_by_packet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.get(packet_id).copied().unwrap_or(0)
     }
 
     fn save_tokens(&self) -> MdeResult<()> {
+        let guard = self
+            .evals_by_packet
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.save_tokens_with_evals(&guard)
+    }
+
+    fn save_tokens_with_evals(&self, evals_map: &BTreeMap<String, u64>) -> MdeResult<()> {
         if !self.persist_tokens {
             return Ok(());
         }
@@ -196,15 +229,39 @@ impl Broker {
             MdeError::new("ERR_IO", format!("failed to create .mde dir: {e}"))
         })?;
         let path = mde_dir.join("session_tokens.json");
+        let digest = compute_token_store_digest(
+            &self.tokens.session_nonce,
+            &self.tokens.tokens,
+            evals_map,
+        )?;
         let snapshot = TokenStore {
             session_nonce: self.tokens.session_nonce.clone(),
             tokens: self.tokens.tokens.clone(),
-            evals_used: self.evals_used.load(Ordering::SeqCst),
+            evals_by_packet: evals_map.clone(),
+            store_sha256: Some(digest),
         };
         let data = serde_json::to_vec_pretty(&snapshot)
             .map_err(|e| MdeError::new("ERR_SERIALIZE", format!("token serialize: {e}")))?;
-        fs::write(path, data)
-            .map_err(|e| MdeError::new("ERR_IO", format!("failed to write token store: {e}")))
+        atomic_write_bytes(&path, &data)
+    }
+
+    fn persist_packet_evals(&self, packet_id: &str, evals_used: u64) -> MdeResult<()> {
+        if !self.persist_tokens {
+            return Ok(());
+        }
+        let dir = self.repo_root.join(".mde/packets");
+        fs::create_dir_all(&dir)
+            .map_err(|e| MdeError::new("ERR_IO", format!("mkdir packets failed: {e}")))?;
+        let fname = format!("{}.evals.json", packet_id.replace(':', "_"));
+        let record_sha256 = compute_packet_eval_digest(packet_id, evals_used)?;
+        let rec = PacketEvalRecord {
+            packet_id: packet_id.to_string(),
+            evals_used,
+            record_sha256,
+        };
+        let data = serde_json::to_vec_pretty(&rec)
+            .map_err(|e| MdeError::new("ERR_SERIALIZE", format!("eval record json: {e}")))?;
+        atomic_write_bytes(&dir.join(fname), &data)
     }
 
     fn mint_token(
@@ -328,16 +385,17 @@ impl Broker {
 
         if let Some(ref sym) = req.symbol {
             for f in &all_files {
-                if let Ok(content) = fs::read(self.repo_root.join(f)) {
-                    let text = String::from_utf8_lossy(&content);
-                    for (idx, line) in text.lines().enumerate() {
-                        if line.contains(sym.as_str()) {
-                            references.push(ReferenceHit {
-                                path: f.clone(),
-                                line: idx + 1,
-                                snippet: line.trim().chars().take(100).collect(),
-                            });
-                        }
+                let content = fs::read(self.repo_root.join(f)).map_err(|e| {
+                    MdeError::new("ERR_IO", format!("trace failed to read {f}: {e}"))
+                })?;
+                let text = String::from_utf8_lossy(&content);
+                for (idx, line) in text.lines().enumerate() {
+                    if line.contains(sym.as_str()) {
+                        references.push(ReferenceHit {
+                            path: f.clone(),
+                            line: idx + 1,
+                            snippet: line.trim().chars().take(100).collect(),
+                        });
                     }
                 }
             }
@@ -348,10 +406,14 @@ impl Broker {
         for hit in &references {
             if !scanned_paths.contains(&hit.path) {
                 scanned_paths.push(hit.path.clone());
-                if let Ok(other_bytes) = fs::read(self.repo_root.join(&hit.path)) {
-                    if let Ok(other_parsed) = analyze_file(&hit.path, &other_bytes) {
-                        dynamic_sites.extend(other_parsed.dynamic_sites);
-                    }
+                let other_bytes = fs::read(self.repo_root.join(&hit.path)).map_err(|e| {
+                    MdeError::new(
+                        "ERR_IO",
+                        format!("trace failed to read referenced {}: {e}", hit.path),
+                    )
+                })?;
+                if let Ok(other_parsed) = analyze_file(&hit.path, &other_bytes) {
+                    dynamic_sites.extend(other_parsed.dynamic_sites);
                 }
             }
         }
@@ -615,19 +677,30 @@ impl Broker {
         let policy = PolicyConfig::load(&self.repo_root)?;
         let packet = self.load_packet(&req.packet_id)?;
         let touched_paths: Vec<String> = packet.edits.iter().map(|e| e.path.clone()).collect();
-        // Track evaluations on the broker so callers cannot spoof eval_count downward to bypass
-        // max_evals, while still honoring any higher caller-supplied floor for compatibility.
-        let next_eval = self.evals_used.load(Ordering::SeqCst).saturating_add(1);
-        let effective_eval = next_eval.max(req.eval_count.unwrap_or(0));
-        validate_call_policy(
-            "splice_verify",
-            &touched_paths,
-            effective_eval,
-            false,
-            &policy,
-        )?;
-        self.evals_used.store(next_eval, Ordering::SeqCst);
-        self.save_tokens()?;
+        // Track evaluations per SplicePacket (`packet_id`) per PROTOCOL.md:49 so callers cannot
+        // spoof eval_count downward, Task A cannot lock out Task B, and disk persistence happens
+        // atomically before committing the in-memory counter bump.
+        {
+            let mut eval_map = self
+                .evals_by_packet
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_used = eval_map.get(&req.packet_id).copied().unwrap_or(0);
+            let next_eval = prev_used.saturating_add(1);
+            let effective_eval = next_eval.max(req.eval_count.unwrap_or(0));
+            validate_call_policy(
+                "splice_verify",
+                &touched_paths,
+                effective_eval,
+                false,
+                &policy,
+            )?;
+            let mut next_map = eval_map.clone();
+            next_map.insert(req.packet_id.clone(), next_eval);
+            self.persist_packet_evals(&req.packet_id, next_eval)?;
+            self.save_tokens_with_evals(&next_map)?;
+            *eval_map = next_map;
+        }
 
         // Prepare isolated disposable workspace (git worktree when HEAD exists, else copy).
         let scratch = create_isolated_workspace(&self.repo_root, &packet.base_commit)?;
@@ -963,16 +1036,33 @@ impl Broker {
             ));
         }
 
-        // Compute exact unified diff digest by staging in a scratch worktree or computing diff.
-        // Write patched bytes temporarily, inspect `git diff -- <files>`, and roll back if blocked.
+        // Write patched bytes under an RAII rollback guard armed before the first write and
+        // disarmed only after a successful commit (rolling back both working tree and git index).
         let touched_vec: Vec<String> = patched_files.keys().cloned().collect();
+        let mut rollback_guard = ProjectRollbackGuard {
+            broker: self,
+            originals: &originals,
+            touched_paths: &touched_vec,
+            armed: true,
+            index_touched: false,
+        };
         for (rel_path, bytes) in &patched_files {
-            fs::write(self.repo_root.join(rel_path), bytes).map_err(|e| {
-                MdeError::new("ERR_IO", format!("failed writing {rel_path}: {e}"))
-            })?;
+            if let Err(e) = fs::write(self.repo_root.join(rel_path), bytes) {
+                rollback_guard.rollback_explicit("ERR_IO")?;
+                return Err(MdeError::new(
+                    "ERR_IO",
+                    format!("failed writing {rel_path}: {e}"),
+                ));
+            }
         }
 
-        let diff_bytes = git_diff_paths(&self.repo_root, &touched_vec)?;
+        let diff_bytes = match git_diff_paths(&self.repo_root, &touched_vec) {
+            Ok(b) => b,
+            Err(err) => {
+                rollback_guard.rollback_explicit(&err.code)?;
+                return Err(err);
+            }
+        };
         let diff_sha256 = sha256_prefixed(&diff_bytes);
 
         // Gate G7.3: hard-block high-risk commits unless exact diff SHA-256 was approved.
@@ -984,7 +1074,7 @@ impl Broker {
                 .unwrap_or(false);
             if !approved {
                 // Roll back working tree before returning refusal; fail explicitly if restore fails.
-                self.rollback_originals(&originals, "ERR_APPROVAL_REQUIRED")?;
+                rollback_guard.rollback_explicit("ERR_APPROVAL_REQUIRED")?;
                 return Err(MdeError::with_detail(
                     "ERR_APPROVAL_REQUIRED",
                     "high-risk splice requires exact diff SHA-256 human approval",
@@ -997,16 +1087,21 @@ impl Broker {
         }
 
         // Stage ONLY touched files and create a clean Git commit (Gate G4.1, zero Co-authored-by).
+        rollback_guard.index_touched = true;
         let mut add_cmd = Command::new("git");
         add_cmd.current_dir(&self.repo_root).arg("add").arg("--");
         for f in &touched_vec {
             add_cmd.arg(f);
         }
-        let add_out = add_cmd
-            .output()
-            .map_err(|e| MdeError::new("ERR_GIT", format!("git add failed: {e}")))?;
+        let add_out = match add_cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                rollback_guard.rollback_explicit("ERR_GIT")?;
+                return Err(MdeError::new("ERR_GIT", format!("git add failed: {e}")));
+            }
+        };
         if !add_out.status.success() {
-            self.rollback_originals(&originals, "ERR_GIT")?;
+            rollback_guard.rollback_explicit("ERR_GIT")?;
             return Err(MdeError::new(
                 "ERR_GIT",
                 format!(
@@ -1032,13 +1127,19 @@ impl Broker {
             packet.packet_id, bundle.bundle_id
         ));
 
-        let commit_out = Command::new("git")
+        let commit_out = match Command::new("git")
             .current_dir(&self.repo_root)
             .args(["commit", "-m", &msg])
             .output()
-            .map_err(|e| MdeError::new("ERR_GIT", format!("git commit failed: {e}")))?;
+        {
+            Ok(o) => o,
+            Err(e) => {
+                rollback_guard.rollback_explicit("ERR_GIT")?;
+                return Err(MdeError::new("ERR_GIT", format!("git commit failed: {e}")));
+            }
+        };
         if !commit_out.status.success() {
-            self.rollback_originals(&originals, "ERR_GIT")?;
+            rollback_guard.rollback_explicit("ERR_GIT")?;
             return Err(MdeError::new(
                 "ERR_GIT",
                 format!(
@@ -1047,6 +1148,7 @@ impl Broker {
                 ),
             ));
         }
+        rollback_guard.disarm();
 
         let commit_sha = git_rev_parse(&self.repo_root, "HEAD").unwrap_or_default();
         Ok(ProjectResult {
@@ -1172,8 +1274,7 @@ impl Broker {
         let fname = format!("{}.json", packet.packet_id.replace(':', "_"));
         let data = serde_json::to_vec_pretty(packet)
             .map_err(|e| MdeError::new("ERR_SERIALIZE", format!("packet json: {e}")))?;
-        fs::write(dir.join(fname), data)
-            .map_err(|e| MdeError::new("ERR_IO", format!("write packet failed: {e}")))
+        atomic_write_bytes(&dir.join(fname), &data)
     }
 
     pub fn load_packet(&self, packet_id: &str) -> MdeResult<SplicePacket> {
@@ -1203,8 +1304,7 @@ impl Broker {
         let fname = format!("{}.json", bundle.bundle_id.replace(':', "_"));
         let data = serde_json::to_vec_pretty(bundle)
             .map_err(|e| MdeError::new("ERR_SERIALIZE", format!("bundle json: {e}")))?;
-        fs::write(dir.join(fname), data)
-            .map_err(|e| MdeError::new("ERR_IO", format!("write bundle failed: {e}")))
+        atomic_write_bytes(&dir.join(fname), &data)
     }
 
     pub fn load_bundle(&self, bundle_id: &str) -> MdeResult<EvidenceBundle> {
@@ -1227,24 +1327,74 @@ impl Broker {
         Ok(bundle)
     }
 
+    #[cfg(test)]
     fn rollback_originals(
         &self,
         originals: &BTreeMap<String, Vec<u8>>,
         cause_code: &str,
     ) -> MdeResult<()> {
+        let touched: Vec<String> = originals.keys().cloned().collect();
+        self.rollback_projection(originals, &touched, false, cause_code)
+    }
+
+    fn rollback_projection(
+        &self,
+        originals: &BTreeMap<String, Vec<u8>>,
+        touched_paths: &[String],
+        unstage_index: bool,
+        cause_code: &str,
+    ) -> MdeResult<()> {
         let mut failed_paths = Vec::new();
         let mut errors = Vec::new();
+
+        if unstage_index && !touched_paths.is_empty() && self.repo_root.join(".git").exists() {
+            let mut unstage_cmd = Command::new("git");
+            unstage_cmd.current_dir(&self.repo_root);
+            if git_rev_parse(&self.repo_root, "HEAD").is_some() {
+                unstage_cmd.args(["reset", "-q", "HEAD", "--"]);
+            } else {
+                unstage_cmd.args(["rm", "-q", "-f", "--cached", "--ignore-unmatch", "--"]);
+            }
+            for p in touched_paths {
+                unstage_cmd.arg(p);
+            }
+            match unstage_cmd.output() {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    failed_paths.push("<git-index>".to_string());
+                    errors.push(format!(
+                        "git index reset failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                Err(err) => {
+                    failed_paths.push("<git-index>".to_string());
+                    errors.push(format!("git index reset spawn failed: {err}"));
+                }
+            }
+        }
+
         for (rel_path, orig) in originals {
-            if let Err(err) = fs::write(self.repo_root.join(rel_path), orig) {
-                failed_paths.push(rel_path.clone());
-                errors.push(format!("{rel_path}: {err}"));
+            let abs = self.repo_root.join(rel_path);
+            if let Err(err) = fs::write(&abs, orig) {
+                // If `fs::write` failed on open before touching a read-only file (so on-disk bytes
+                // already match `orig` verbatim), the file is already intact; otherwise fail closed.
+                let intact = fs::read(&abs)
+                    .ok()
+                    .as_deref()
+                    .map(|cur| cur == orig.as_slice())
+                    .unwrap_or(false);
+                if !intact {
+                    failed_paths.push(rel_path.clone());
+                    errors.push(format!("{rel_path}: {err}"));
+                }
             }
         }
         if !failed_paths.is_empty() {
             return Err(MdeError::with_detail(
                 "ERR_ROLLBACK_FAILED",
                 format!(
-                    "failed to roll back working tree after {cause_code}: {}",
+                    "failed to roll back working tree/index after {cause_code}: {}",
                     errors.join("; ")
                 ),
                 json!({
@@ -1256,6 +1406,100 @@ impl Broker {
         }
         Ok(())
     }
+}
+
+struct ProjectRollbackGuard<'a> {
+    broker: &'a Broker,
+    originals: &'a BTreeMap<String, Vec<u8>>,
+    touched_paths: &'a [String],
+    armed: bool,
+    index_touched: bool,
+}
+
+impl<'a> ProjectRollbackGuard<'a> {
+    fn rollback_explicit(&mut self, cause_code: &str) -> MdeResult<()> {
+        self.armed = false;
+        self.broker.rollback_projection(
+            self.originals,
+            self.touched_paths,
+            self.index_touched,
+            cause_code,
+        )
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProjectRollbackGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.broker.rollback_projection(
+                self.originals,
+                self.touched_paths,
+                self.index_touched,
+                "DROP_UNWIND",
+            );
+        }
+    }
+}
+
+fn atomic_write_bytes(path: &Path, data: &[u8]) -> MdeResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| MdeError::new("ERR_IO", "target path has no parent directory"))?;
+    let fname = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mde.tmp".to_string());
+    let seq = TMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(".tmp.{}.{}.{}.{}", fname, std::process::id(), nanos, seq));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp_path, path)
+    })();
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(MdeError::new(
+            "ERR_IO",
+            format!("atomic write failed for {}: {err}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn compute_token_store_digest(
+    nonce: &str,
+    tokens: &BTreeMap<String, TokenRecord>,
+    evals_by_packet: &BTreeMap<String, u64>,
+) -> MdeResult<String> {
+    let payload = json!({
+        "domain": "mde-token-store/v1",
+        "session_nonce": nonce,
+        "tokens": tokens,
+        "evals_by_packet": evals_by_packet,
+    });
+    canonical_json_sha256(&payload, None)
+}
+
+fn compute_packet_eval_digest(packet_id: &str, evals_used: u64) -> MdeResult<String> {
+    let payload = json!({
+        "domain": "mde-packet-eval/v1",
+        "packet_id": packet_id,
+        "evals_used": evals_used,
+    });
+    canonical_json_sha256(&payload, None)
 }
 
 fn validate_digest_id(id: &str, field: &str) -> MdeResult<()> {
@@ -1288,14 +1532,148 @@ fn new_token_store() -> TokenStore {
     TokenStore {
         session_nonce: nonce,
         tokens: BTreeMap::new(),
-        evals_used: 0,
+        evals_by_packet: BTreeMap::new(),
+        store_sha256: None,
     }
 }
 
-fn load_token_store(repo_root: &Path) -> Option<TokenStore> {
+fn load_recorded_packet_evals(repo_root: &Path) -> MdeResult<BTreeMap<String, u64>> {
+    let packets_dir = repo_root.join(".mde/packets");
+    match fs::symlink_metadata(&packets_dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(MdeError::new(
+                "ERR_TOKEN_STORE",
+                ".mde/packets exists but is not a plain directory",
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(MdeError::new(
+                "ERR_TOKEN_STORE",
+                format!("cannot stat .mde/packets: {e}"),
+            ));
+        }
+    }
+    let mut recorded = BTreeMap::new();
+    let entries = fs::read_dir(&packets_dir).map_err(|e| {
+        MdeError::new("ERR_TOKEN_STORE", format!("cannot read .mde/packets: {e}"))
+    })?;
+    for entry_res in entries {
+        let entry = entry_res.map_err(|e| {
+            MdeError::new(
+                "ERR_TOKEN_STORE",
+                format!("cannot read .mde/packets entry: {e}"),
+            )
+        })?;
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if !fname.ends_with(".evals.json") {
+            continue;
+        }
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).map_err(|e| {
+            MdeError::new(
+                "ERR_TOKEN_STORE",
+                format!("cannot stat eval record {fname}: {e}"),
+            )
+        })?;
+        if !meta.file_type().is_file() {
+            return Err(MdeError::new(
+                "ERR_TOKEN_STORE",
+                format!("eval record {fname} is not a regular file"),
+            ));
+        }
+        let raw_text = fs::read_to_string(&path).map_err(|e| {
+            MdeError::new(
+                "ERR_TOKEN_STORE",
+                format!("cannot read eval record {fname}: {e}"),
+            )
+        })?;
+        let rec: PacketEvalRecord = serde_json::from_str(&raw_text).map_err(|e| {
+            MdeError::new(
+                "ERR_TOKEN_STORE",
+                format!("corrupt eval record {fname}: {e}"),
+            )
+        })?;
+        let expected_sha = compute_packet_eval_digest(&rec.packet_id, rec.evals_used)?;
+        if rec.record_sha256 != expected_sha {
+            return Err(MdeError::new(
+                "ERR_TOKEN_STORE",
+                format!("eval record digest mismatch in {fname}"),
+            ));
+        }
+        let prev = recorded.get(&rec.packet_id).copied().unwrap_or(0);
+        if rec.evals_used > prev {
+            recorded.insert(rec.packet_id, rec.evals_used);
+        }
+    }
+    Ok(recorded)
+}
+
+fn load_token_store(repo_root: &Path) -> MdeResult<Option<TokenStore>> {
+    let recorded_evals = load_recorded_packet_evals(repo_root)?;
     let path = repo_root.join(".mde/session_tokens.json");
-    let raw_text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw_text).ok()
+    match fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if !meta.file_type().is_file() {
+                return Err(MdeError::new(
+                    "ERR_TOKEN_STORE",
+                    ".mde/session_tokens.json must be a regular file",
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !recorded_evals.is_empty() {
+                return Err(MdeError::new(
+                    "ERR_TOKEN_STORE",
+                    "persisted .mde/session_tokens.json missing after eval budget state was recorded",
+                ));
+            }
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(MdeError::new(
+                "ERR_TOKEN_STORE",
+                format!("failed to stat .mde/session_tokens.json: {e}"),
+            ));
+        }
+    }
+
+    let raw_text = fs::read_to_string(&path).map_err(|e| {
+        MdeError::new(
+            "ERR_TOKEN_STORE",
+            format!("failed to read .mde/session_tokens.json: {e}"),
+        )
+    })?;
+    let store: TokenStore = serde_json::from_str(&raw_text).map_err(|e| {
+        MdeError::new(
+            "ERR_TOKEN_STORE",
+            format!("corrupt .mde/session_tokens.json: {e}"),
+        )
+    })?;
+    let expected_digest = compute_token_store_digest(
+        &store.session_nonce,
+        &store.tokens,
+        &store.evals_by_packet,
+    )?;
+    if store.store_sha256.as_deref() != Some(expected_digest.as_str()) {
+        return Err(MdeError::new(
+            "ERR_TOKEN_STORE",
+            "token store integrity digest missing or mismatched in .mde/session_tokens.json",
+        ));
+    }
+    for (pkt_id, min_used) in &recorded_evals {
+        let store_used = store.evals_by_packet.get(pkt_id).copied().unwrap_or(0);
+        if store_used < *min_used {
+            return Err(MdeError::new(
+                "ERR_TOKEN_STORE",
+                format!(
+                    "token store eval count for {pkt_id} ({store_used}) rolled back below recorded {min_used}"
+                ),
+            ));
+        }
+    }
+    Ok(Some(store))
 }
 
 fn git_rev_parse(repo_root: &Path, rev: &str) -> Option<String> {
@@ -1312,7 +1690,14 @@ fn git_rev_parse(repo_root: &Path, rev: &str) -> Option<String> {
 
 fn git_diff_paths(repo_root: &Path, paths: &[String]) -> MdeResult<Vec<u8>> {
     let mut cmd = Command::new("git");
-    cmd.current_dir(repo_root).args(["diff", "--"]);
+    cmd.current_dir(repo_root).args([
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--full-index",
+        "--binary",
+        "--",
+    ]);
     for p in paths {
         cmd.arg(p);
     }
@@ -1349,15 +1734,64 @@ fn walk_dir_rel(root: &Path, dir: &Path, out: &mut Vec<String>) -> MdeResult<()>
             continue;
         }
         let path = entry.path();
-        if path.is_dir() {
+        let meta = fs::symlink_metadata(&path).map_err(|e| {
+            MdeError::new(
+                "ERR_IO",
+                format!("workspace metadata failed for {}: {e}", path.display()),
+            )
+        })?;
+        let ft = meta.file_type();
+        if ft.is_dir() {
             walk_dir_rel(root, &path, out)?;
-        } else if path.is_file() {
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
+        } else if ft.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| MdeError::new("ERR_IO", format!("strip_prefix failed: {e}")))?;
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        } else if ft.is_symlink() {
+            let resolved = fs::canonicalize(&path).map_err(|e| {
+                MdeError::new(
+                    "ERR_IO",
+                    format!("broken or unreadable symlink {}: {e}", path.display()),
+                )
+            })?;
+            if !resolved.starts_with(root) || resolved.is_dir() {
+                return Err(MdeError::new(
+                    "ERR_PATH_OUT_OF_BOUNDS",
+                    format!(
+                        "escaping or directory symlink in workspace: {}",
+                        path.display()
+                    ),
+                ));
             }
+            if resolved.is_file() {
+                let rel = path
+                    .strip_prefix(root)
+                    .map_err(|e| MdeError::new("ERR_IO", format!("strip_prefix failed: {e}")))?;
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            } else {
+                return Err(MdeError::new(
+                    "ERR_IO",
+                    format!("unsupported special file symlink in workspace: {}", path.display()),
+                ));
+            }
+        } else {
+            return Err(MdeError::new(
+                "ERR_IO",
+                format!("unsupported special file in workspace: {}", path.display()),
+            ));
         }
     }
     Ok(())
+}
+
+fn append_length_prefixed_entry(manifest: &mut Vec<u8>, path: &str, value: &str) {
+    let path_bytes = path.as_bytes();
+    manifest.extend_from_slice(&(path_bytes.len() as u64).to_be_bytes());
+    manifest.extend_from_slice(path_bytes);
+    manifest.push(0);
+    manifest.extend_from_slice(value.as_bytes());
+    manifest.push(b'\n');
 }
 
 fn workspace_tree_digest(root: &Path, overrides: &BTreeMap<String, Vec<u8>>) -> MdeResult<String> {
@@ -1368,7 +1802,7 @@ fn workspace_tree_digest(root: &Path, overrides: &BTreeMap<String, Vec<u8>>) -> 
         }
     }
     files.sort();
-    let mut manifest = Vec::new();
+    let mut manifest = Vec::from(&b"mde-workspace-tree-v1\0"[..]);
     for f in files {
         let h = if let Some(b) = overrides.get(&f) {
             sha256_prefixed(b)
@@ -1378,7 +1812,7 @@ fn workspace_tree_digest(root: &Path, overrides: &BTreeMap<String, Vec<u8>>) -> 
             })?;
             sha256_prefixed(&b)
         };
-        manifest.extend_from_slice(format!("{f}\t{h}\n").as_bytes());
+        append_length_prefixed_entry(&mut manifest, &f, &h);
     }
     Ok(sha256_prefixed(&manifest))
 }
@@ -1393,13 +1827,23 @@ fn hash_protected_oracles(work_dir: &Path, policy: &PolicyConfig) -> MdeResult<S
     for spec in &policy.protected_oracle_paths {
         if spec.ends_with('/') {
             let dir = work_dir.join(spec.trim_end_matches('/'));
-            if dir.is_dir() {
-                let mut nested = Vec::new();
-                collect_all_files_in_dir(work_dir, &dir, &mut nested)?;
-                for f in nested {
-                    if !targets.contains(&f) {
-                        targets.push(f);
+            match fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.file_type().is_dir() => {
+                    let mut nested = Vec::new();
+                    collect_all_files_in_dir(work_dir, &dir, &mut nested)?;
+                    for f in nested {
+                        if !targets.contains(&f) {
+                            targets.push(f);
+                        }
                     }
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(MdeError::new(
+                        "ERR_IO",
+                        format!("oracle dir metadata failed for {spec}: {e}"),
+                    ));
                 }
             }
         } else if !targets.contains(spec) {
@@ -1408,16 +1852,28 @@ fn hash_protected_oracles(work_dir: &Path, policy: &PolicyConfig) -> MdeResult<S
     }
     targets.sort();
 
-    let mut manifest = Vec::new();
+    let mut manifest = Vec::from(&b"mde-oracle-tree-v1\0"[..]);
     for f in targets {
         let abs = work_dir.join(&f);
-        if abs.is_file() {
-            let bytes = fs::read(&abs).map_err(|e| {
-                MdeError::new("ERR_IO", format!("oracle read failed for {f}: {e}"))
-            })?;
-            manifest.extend_from_slice(format!("{f}\t{}\n", sha256_prefixed(&bytes)).as_bytes());
-        } else {
-            manifest.extend_from_slice(format!("{f}\tABSENT\n").as_bytes());
+        match fs::symlink_metadata(&abs) {
+            Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+                let bytes = fs::read(&abs).map_err(|e| {
+                    MdeError::new("ERR_IO", format!("oracle read failed for {f}: {e}"))
+                })?;
+                append_length_prefixed_entry(&mut manifest, &f, &sha256_prefixed(&bytes));
+            }
+            Ok(_) => {
+                append_length_prefixed_entry(&mut manifest, &f, "NONFILE");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                append_length_prefixed_entry(&mut manifest, &f, "ABSENT");
+            }
+            Err(e) => {
+                return Err(MdeError::new(
+                    "ERR_IO",
+                    format!("oracle metadata failed for {f}: {e}"),
+                ));
+            }
         }
     }
     Ok(sha256_prefixed(&manifest))
@@ -1426,14 +1882,20 @@ fn hash_protected_oracles(work_dir: &Path, policy: &PolicyConfig) -> MdeResult<S
 fn collect_all_files_in_dir(root: &Path, dir: &Path, out: &mut Vec<String>) -> MdeResult<()> {
     let entries = fs::read_dir(dir)
         .map_err(|e| MdeError::new("ERR_IO", format!("read_dir failed: {e}")))?;
-    for entry in entries.flatten() {
+    for entry_res in entries {
+        let entry = entry_res
+            .map_err(|e| MdeError::new("ERR_IO", format!("read_dir entry failed: {e}")))?;
         let path = entry.path();
-        if path.is_dir() {
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| MdeError::new("ERR_IO", format!("oracle metadata failed: {e}")))?;
+        let ft = meta.file_type();
+        if ft.is_dir() {
             collect_all_files_in_dir(root, &path, out)?;
-        } else if path.is_file() {
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
-            }
+        } else if ft.is_file() || ft.is_symlink() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| MdeError::new("ERR_IO", format!("strip_prefix failed: {e}")))?;
+            out.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
     Ok(())
@@ -1552,6 +2014,7 @@ mod tests {
     fn rollback_originals_surfaces_err_rollback_failed_and_restores_writable_siblings() {
         let uid_out = Command::new("id").arg("-u").output().unwrap();
         if String::from_utf8_lossy(&uid_out.stdout).trim() == "0" {
+            eprintln!("SKIPPED rollback_originals DAC test: uid == 0 bypasses 0o444 permissions");
             return;
         }
         let tmp = TempDir::new().unwrap();

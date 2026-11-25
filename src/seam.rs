@@ -357,9 +357,9 @@ pub fn verify_seam_manifest(repo_root: &Path, manifest_rel: &str) -> MdeResult<S
         if !is_code_or_manifest {
             continue;
         }
-        let Ok(content) = fs::read_to_string(canon_root.join(&rel)) else {
-            continue;
-        };
+        let raw_bytes = fs::read(canon_root.join(&rel))
+            .map_err(|e| MdeError::new("ERR_IO", format!("failed to read core file {rel}: {e}")))?;
+        let content = String::from_utf8_lossy(&raw_bytes);
         if content.contains(&slash_needle)
             || content.contains(&dot_needle)
             || content.contains(&rust_needle)
@@ -412,24 +412,53 @@ pub fn verify_all_seams(repo_root: &Path) -> MdeResult<SeamSuiteReport> {
         MdeError::new("ERR_REPO_ROOT", format!("cannot canonicalize repo root: {e}"))
     })?;
     let splices_dir = canon_root.join("vendor/splices");
-    if !splices_dir.is_dir() {
-        return Ok(SeamSuiteReport {
-            ok: true,
-            slices_verified: 0,
-            reports: Vec::new(),
-        });
+    match fs::symlink_metadata(&splices_dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(MdeError::new(
+                "ERR_INVALID_SEAM_PATH",
+                "vendor/splices exists but is not a plain directory",
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SeamSuiteReport {
+                ok: true,
+                slices_verified: 0,
+                reports: Vec::new(),
+            });
+        }
+        Err(e) => {
+            return Err(MdeError::new(
+                "ERR_IO",
+                format!("metadata failed on vendor/splices: {e}"),
+            ));
+        }
     }
 
     let mut manifests = Vec::new();
     let entries = fs::read_dir(&splices_dir)
         .map_err(|e| MdeError::new("ERR_IO", format!("read vendor/splices failed: {e}")))?;
-    for entry in entries.flatten() {
+    for entry_res in entries {
+        let entry = entry_res
+            .map_err(|e| MdeError::new("ERR_IO", format!("vendor/splices entry failed: {e}")))?;
         let path = entry.path();
-        if path.is_dir() {
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| MdeError::new("ERR_IO", format!("vendor/splices stat failed: {e}")))?;
+        if meta.file_type().is_dir() {
             let candidate = path.join("splice.json");
-            if candidate.is_file() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                manifests.push(format!("vendor/splices/{name}/splice.json"));
+            match fs::symlink_metadata(&candidate) {
+                Ok(cmeta) if cmeta.file_type().is_file() => {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    manifests.push(format!("vendor/splices/{name}/splice.json"));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(MdeError::new(
+                        "ERR_IO",
+                        format!("splice.json stat failed: {e}"),
+                    ));
+                }
             }
         }
     }
@@ -471,7 +500,9 @@ fn collect_files_under(
 
     let entries = fs::read_dir(dir)
         .map_err(|e| MdeError::new("ERR_IO", format!("read_dir failed: {e}")))?;
-    let mut sorted: Vec<_> = entries.flatten().collect();
+    let mut sorted: Vec<_> = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| MdeError::new("ERR_IO", format!("read_dir entry failed: {e}")))?;
     sorted.sort_by_key(|e| e.file_name());
 
     for entry in sorted {
@@ -482,7 +513,8 @@ fn collect_files_under(
         let path = entry.path();
         let meta = fs::symlink_metadata(&path)
             .map_err(|e| MdeError::new("ERR_IO", format!("metadata failed: {e}")))?;
-        if meta.file_type().is_symlink() {
+        let ft = meta.file_type();
+        if ft.is_symlink() {
             let target = fs::canonicalize(&path).map_err(|e| {
                 MdeError::new(
                     "ERR_PATH_OUT_OF_BOUNDS",
@@ -503,9 +535,9 @@ fn collect_files_under(
             }
         }
 
-        if path.is_dir() {
+        if ft.is_dir() {
             collect_files_under(canon_root, &path, visited, out)?;
-        } else if path.is_file() {
+        } else if ft.is_file() || ft.is_symlink() {
             if let Ok(rel) = path.strip_prefix(canon_root) {
                 out.push(rel.to_string_lossy().replace('\\', "/"));
             }
@@ -528,28 +560,36 @@ fn walk_core(
     visited: &mut BTreeSet<PathBuf>,
     out: &mut Vec<String>,
 ) -> MdeResult<()> {
-    let Ok(canon_dir) = fs::canonicalize(dir) else {
-        return Ok(());
-    };
-    if !canon_dir.starts_with(root) || !visited.insert(canon_dir) {
+    let canon_dir = fs::canonicalize(dir)
+        .map_err(|e| MdeError::new("ERR_IO", format!("canonicalize failed in walk_core: {e}")))?;
+    if !canon_dir.starts_with(root) {
+        return Err(MdeError::new(
+            "ERR_PATH_OUT_OF_BOUNDS",
+            "core directory walk escaped repository root",
+        ));
+    }
+    if !visited.insert(canon_dir) {
         return Ok(());
     }
     let entries = fs::read_dir(dir)
         .map_err(|e| MdeError::new("ERR_IO", format!("read_dir failed: {e}")))?;
-    for entry in entries.flatten() {
+    for entry_res in entries {
+        let entry = entry_res
+            .map_err(|e| MdeError::new("ERR_IO", format!("read_dir entry failed: {e}")))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if CORE_SKIP_DIRS.contains(&name.as_str()) {
             continue;
         }
         let path = entry.path();
-        if let Ok(meta) = fs::symlink_metadata(&path) {
-            if meta.file_type().is_symlink() {
-                continue;
-            }
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| MdeError::new("ERR_IO", format!("metadata failed in walk_core: {e}")))?;
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            continue;
         }
-        if path.is_dir() {
+        if ft.is_dir() {
             walk_core(root, &path, visited, out)?;
-        } else if path.is_file() {
+        } else if ft.is_file() {
             if let Ok(rel) = path.strip_prefix(root) {
                 out.push(rel.to_string_lossy().replace('\\', "/"));
             }
