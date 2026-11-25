@@ -195,12 +195,24 @@ pub fn verify_seam_manifest(repo_root: &Path, manifest_rel: &str) -> MdeResult<S
                     invariant: "seam_containment".into(),
                     detail: format!("seam.path '{norm}' does not exist"),
                 });
-            } else if let Ok(seam_src) = fs::read_to_string(&abs) {
-                for sym in &manifest.seam.exports {
-                    if !seam_src.contains(sym.as_str()) {
+            } else {
+                match fs::read_to_string(&abs) {
+                    Ok(seam_src) => {
+                        for sym in &manifest.seam.exports {
+                            if !seam_src.contains(sym.as_str()) {
+                                failures.push(SeamCheckFailure {
+                                    invariant: "seam_exports".into(),
+                                    detail: format!(
+                                        "declared export '{sym}' not found in {norm}"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    Err(err) => {
                         failures.push(SeamCheckFailure {
                             invariant: "seam_exports".into(),
-                            detail: format!("declared export '{sym}' not found in {norm}"),
+                            detail: format!("failed to read seam file {norm} as UTF-8: {err}"),
                         });
                     }
                 }

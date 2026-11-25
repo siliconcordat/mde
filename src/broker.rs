@@ -19,10 +19,11 @@ use crate::types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,7 +38,9 @@ pub struct TokenRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct TokenStore {
     session_nonce: String,
-    tokens: HashMap<String, TokenRecord>,
+    tokens: BTreeMap<String, TokenRecord>,
+    #[serde(default)]
+    evals_used: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +154,7 @@ pub struct Broker {
     repo_root: PathBuf,
     tokens: TokenStore,
     persist_tokens: bool,
+    evals_used: AtomicU64,
 }
 
 impl Broker {
@@ -166,15 +170,21 @@ impl Broker {
         } else {
             new_token_store()
         };
+        let evals_used = AtomicU64::new(tokens.evals_used);
         Ok(Self {
             repo_root: root,
             tokens,
             persist_tokens,
+            evals_used,
         })
     }
 
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
+    }
+
+    pub fn evals_used(&self) -> u64 {
+        self.evals_used.load(Ordering::SeqCst)
     }
 
     fn save_tokens(&self) -> MdeResult<()> {
@@ -186,7 +196,12 @@ impl Broker {
             MdeError::new("ERR_IO", format!("failed to create .mde dir: {e}"))
         })?;
         let path = mde_dir.join("session_tokens.json");
-        let data = serde_json::to_vec_pretty(&self.tokens)
+        let snapshot = TokenStore {
+            session_nonce: self.tokens.session_nonce.clone(),
+            tokens: self.tokens.tokens.clone(),
+            evals_used: self.evals_used.load(Ordering::SeqCst),
+        };
+        let data = serde_json::to_vec_pretty(&snapshot)
             .map_err(|e| MdeError::new("ERR_SERIALIZE", format!("token serialize: {e}")))?;
         fs::write(path, data)
             .map_err(|e| MdeError::new("ERR_IO", format!("failed to write token store: {e}")))
@@ -537,9 +552,11 @@ impl Broker {
         }
 
         let base_commit = git_rev_parse(&self.repo_root, "HEAD").unwrap_or_default();
-        let base_tree = git_rev_parse(&self.repo_root, "HEAD^{tree}")
-            .unwrap_or_else(|| workspace_tree_digest(&self.repo_root, &BTreeMap::new()));
-        let expected_result_tree = workspace_tree_digest(&self.repo_root, &staged_outputs);
+        let base_tree = match git_rev_parse(&self.repo_root, "HEAD^{tree}") {
+            Some(tree) => tree,
+            None => workspace_tree_digest(&self.repo_root, &BTreeMap::new())?,
+        };
+        let expected_result_tree = workspace_tree_digest(&self.repo_root, &staged_outputs)?;
 
         let seam_contract = req.seam_contract.unwrap_or(SeamContract {
             exported_symbols_touched: exported_syms.clone(),
@@ -598,13 +615,19 @@ impl Broker {
         let policy = PolicyConfig::load(&self.repo_root)?;
         let packet = self.load_packet(&req.packet_id)?;
         let touched_paths: Vec<String> = packet.edits.iter().map(|e| e.path.clone()).collect();
+        // Track evaluations on the broker so callers cannot spoof eval_count downward to bypass
+        // max_evals, while still honoring any higher caller-supplied floor for compatibility.
+        let next_eval = self.evals_used.load(Ordering::SeqCst).saturating_add(1);
+        let effective_eval = next_eval.max(req.eval_count.unwrap_or(0));
         validate_call_policy(
             "splice_verify",
             &touched_paths,
-            req.eval_count.unwrap_or(1),
+            effective_eval,
             false,
             &policy,
         )?;
+        self.evals_used.store(next_eval, Ordering::SeqCst);
+        self.save_tokens()?;
 
         // Prepare isolated disposable workspace (git worktree when HEAD exists, else copy).
         let scratch = create_isolated_workspace(&self.repo_root, &packet.base_commit)?;
@@ -813,7 +836,7 @@ impl Broker {
             "rejected".to_string()
         };
 
-        let result_tree = workspace_tree_digest(work_dir, &BTreeMap::new());
+        let result_tree = workspace_tree_digest(work_dir, &BTreeMap::new())?;
         let requires_approval = packet.risk_class == RiskClass::HighRisk;
 
         let mut bundle = EvidenceBundle {
@@ -871,8 +894,10 @@ impl Broker {
 
         // Enforce live tree and commit freshness before projecting.
         let current_head = git_rev_parse(&self.repo_root, "HEAD").unwrap_or_default();
-        let current_base_tree = git_rev_parse(&self.repo_root, "HEAD^{tree}")
-            .unwrap_or_else(|| workspace_tree_digest(&self.repo_root, &BTreeMap::new()));
+        let current_base_tree = match git_rev_parse(&self.repo_root, "HEAD^{tree}") {
+            Some(tree) => tree,
+            None => workspace_tree_digest(&self.repo_root, &BTreeMap::new())?,
+        };
         if (!packet.base_commit.is_empty() && current_head != packet.base_commit)
             || current_base_tree != packet.base_tree
         {
@@ -923,7 +948,7 @@ impl Broker {
         }
 
         // Verify live patched workspace tree matches both bundle.result_tree and expected_result_tree.
-        let actual_result_tree = workspace_tree_digest(&self.repo_root, &patched_files);
+        let actual_result_tree = workspace_tree_digest(&self.repo_root, &patched_files)?;
         if actual_result_tree != bundle.result_tree
             || actual_result_tree != packet.git_projection.expected_result_tree
         {
@@ -958,10 +983,8 @@ impl Broker {
                 .map(|a| a == diff_sha256)
                 .unwrap_or(false);
             if !approved {
-                // Roll back working tree before returning refusal.
-                for (rel_path, orig) in &originals {
-                    let _ = fs::write(self.repo_root.join(rel_path), orig);
-                }
+                // Roll back working tree before returning refusal; fail explicitly if restore fails.
+                self.rollback_originals(&originals, "ERR_APPROVAL_REQUIRED")?;
                 return Err(MdeError::with_detail(
                     "ERR_APPROVAL_REQUIRED",
                     "high-risk splice requires exact diff SHA-256 human approval",
@@ -983,9 +1006,7 @@ impl Broker {
             .output()
             .map_err(|e| MdeError::new("ERR_GIT", format!("git add failed: {e}")))?;
         if !add_out.status.success() {
-            for (rel_path, orig) in &originals {
-                let _ = fs::write(self.repo_root.join(rel_path), orig);
-            }
+            self.rollback_originals(&originals, "ERR_GIT")?;
             return Err(MdeError::new(
                 "ERR_GIT",
                 format!(
@@ -1017,9 +1038,7 @@ impl Broker {
             .output()
             .map_err(|e| MdeError::new("ERR_GIT", format!("git commit failed: {e}")))?;
         if !commit_out.status.success() {
-            for (rel_path, orig) in &originals {
-                let _ = fs::write(self.repo_root.join(rel_path), orig);
-            }
+            self.rollback_originals(&originals, "ERR_GIT")?;
             return Err(MdeError::new(
                 "ERR_GIT",
                 format!(
@@ -1207,6 +1226,36 @@ impl Broker {
         }
         Ok(bundle)
     }
+
+    fn rollback_originals(
+        &self,
+        originals: &BTreeMap<String, Vec<u8>>,
+        cause_code: &str,
+    ) -> MdeResult<()> {
+        let mut failed_paths = Vec::new();
+        let mut errors = Vec::new();
+        for (rel_path, orig) in originals {
+            if let Err(err) = fs::write(self.repo_root.join(rel_path), orig) {
+                failed_paths.push(rel_path.clone());
+                errors.push(format!("{rel_path}: {err}"));
+            }
+        }
+        if !failed_paths.is_empty() {
+            return Err(MdeError::with_detail(
+                "ERR_ROLLBACK_FAILED",
+                format!(
+                    "failed to roll back working tree after {cause_code}: {}",
+                    errors.join("; ")
+                ),
+                json!({
+                    "cause": cause_code,
+                    "failed_paths": failed_paths,
+                    "errors": errors
+                }),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn validate_digest_id(id: &str, field: &str) -> MdeResult<()> {
@@ -1238,7 +1287,8 @@ fn new_token_store() -> TokenStore {
     let nonce = sha256_prefixed(format!("mde-session-{pid}-{nanos}").as_bytes());
     TokenStore {
         session_nonce: nonce,
-        tokens: HashMap::new(),
+        tokens: BTreeMap::new(),
+        evals_used: 0,
     }
 }
 
@@ -1288,7 +1338,9 @@ fn collect_workspace_files(root: &Path) -> MdeResult<Vec<String>> {
 fn walk_dir_rel(root: &Path, dir: &Path, out: &mut Vec<String>) -> MdeResult<()> {
     let entries = fs::read_dir(dir)
         .map_err(|e| MdeError::new("ERR_IO", format!("read_dir failed: {e}")))?;
-    for entry in entries.flatten() {
+    for entry_res in entries {
+        let entry = entry_res
+            .map_err(|e| MdeError::new("ERR_IO", format!("read_dir entry failed: {e}")))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if matches!(
             name.as_str(),
@@ -1308,8 +1360,8 @@ fn walk_dir_rel(root: &Path, dir: &Path, out: &mut Vec<String>) -> MdeResult<()>
     Ok(())
 }
 
-fn workspace_tree_digest(root: &Path, overrides: &BTreeMap<String, Vec<u8>>) -> String {
-    let mut files = collect_workspace_files(root).unwrap_or_default();
+fn workspace_tree_digest(root: &Path, overrides: &BTreeMap<String, Vec<u8>>) -> MdeResult<String> {
+    let mut files = collect_workspace_files(root)?;
     for k in overrides.keys() {
         if !files.contains(k) {
             files.push(k.clone());
@@ -1320,14 +1372,15 @@ fn workspace_tree_digest(root: &Path, overrides: &BTreeMap<String, Vec<u8>>) -> 
     for f in files {
         let h = if let Some(b) = overrides.get(&f) {
             sha256_prefixed(b)
-        } else if let Ok(b) = fs::read(root.join(&f)) {
-            sha256_prefixed(&b)
         } else {
-            continue;
+            let b = fs::read(root.join(&f)).map_err(|e| {
+                MdeError::new("ERR_IO", format!("workspace digest read failed for {f}: {e}"))
+            })?;
+            sha256_prefixed(&b)
         };
         manifest.extend_from_slice(format!("{f}\t{h}\n").as_bytes());
     }
-    sha256_prefixed(&manifest)
+    Ok(sha256_prefixed(&manifest))
 }
 
 fn hash_protected_oracles(work_dir: &Path, policy: &PolicyConfig) -> MdeResult<String> {
@@ -1484,4 +1537,46 @@ fn run_command_checked(work_dir: &Path, cmd: &[String]) -> MdeResult<(CommandRes
         passed: exit_code == 0,
     };
     Ok((res, combined))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_originals_surfaces_err_rollback_failed_and_restores_writable_siblings() {
+        let uid_out = Command::new("id").arg("-u").output().unwrap();
+        if String::from_utf8_lossy(&uid_out.stdout).trim() == "0" {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("auth")).unwrap();
+        let locked = root.join("auth/locked.rs");
+        let sibling = root.join("auth/sibling.rs");
+        fs::write(&locked, b"modified_locked").unwrap();
+        fs::write(&sibling, b"modified_sibling").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let broker = Broker::open(root, false).unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("auth/locked.rs".to_string(), b"orig_locked".to_vec());
+        originals.insert("auth/sibling.rs".to_string(), b"orig_sibling".to_vec());
+
+        let res = broker.rollback_originals(&originals, "ERR_APPROVAL_REQUIRED");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = res.expect_err("read-only target must surface ERR_ROLLBACK_FAILED");
+        assert_eq!(err.code, "ERR_ROLLBACK_FAILED");
+        let detail = err.detail.as_ref().expect("expected rollback detail");
+        assert_eq!(detail["cause"], "ERR_APPROVAL_REQUIRED");
+        assert_eq!(detail["failed_paths"], json!(["auth/locked.rs"]));
+        // Writable sibling was still restored cleanly.
+        assert_eq!(fs::read(&sibling).unwrap(), b"orig_sibling");
+    }
 }
