@@ -46,7 +46,7 @@ Before executing any tool call, the broker evaluates a deterministic policy chec
 1. Confine every path inside the repository root (rejects `..` traversal, absolute paths outside the root, and symlink escapes).
 2. Block writes to `protected_oracle_paths` (such as `tests/`, `anchors/`, or `.mde/anchors.json`) unless an explicit separate `anchor_spec_change` capability is invoked and marked `high_risk`.
 3. Classify `risk_triggers` (`auth`, `public_api`, `schema`, `infra`, `anchors`) from touched paths and exported symbols. Any trigger promotes `risk_class` to `high_risk`.
-4. Enforce hard per-task caps (`max_evals`, `max_wall_sec`, `max_trace_bytes`) and secret regex scanning on all captured stdout, stderr, and packet metadata (rejecting private keys, tokens, and local home-directory paths).
+4. Enforce hard per-packet caps (`max_evals` keyed per `SplicePacket` `packet_id` in `.mde/session_tokens.json` and `.mde/packets/<packet_id>.evals.json`, failing closed with `ERR_TOKEN_STORE` on missing, corrupt, or digest-mismatched token stores once budget state exists, along with `max_wall_sec` and `max_trace_bytes`) and secret regex scanning on all captured stdout, stderr, and packet metadata (rejecting private keys, tokens, and local home-directory paths).
 
 ### 2.4 Syntactic zone classifier (L5 to L4/L2 bridge)
 

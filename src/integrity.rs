@@ -104,7 +104,9 @@ fn walk_confined(
 ) -> MdeResult<()> {
     let entries = fs::read_dir(dir)
         .map_err(|e| MdeError::new("ERR_IO", format!("read_dir failed: {e}")))?;
-    let mut sorted_entries: Vec<_> = entries.flatten().collect();
+    let mut sorted_entries: Vec<_> = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| MdeError::new("ERR_IO", format!("read_dir entry failed: {e}")))?;
     sorted_entries.sort_by_key(|e| e.file_name());
 
     for entry in sorted_entries {
@@ -115,8 +117,9 @@ fn walk_confined(
         let path = entry.path();
         let meta = fs::symlink_metadata(&path)
             .map_err(|e| MdeError::new("ERR_IO", format!("metadata failed: {e}")))?;
+        let ft = meta.file_type();
 
-        if meta.file_type().is_symlink() {
+        if ft.is_symlink() {
             let resolved = fs::canonicalize(&path).map_err(|e| {
                 MdeError::new(
                     "ERR_PATH_OUT_OF_BOUNDS",
@@ -137,9 +140,9 @@ fn walk_confined(
             }
         }
 
-        if path.is_dir() {
+        if ft.is_dir() {
             walk_confined(canon_root, &path, manifest_name, skip_cargo_lock, out)?;
-        } else if path.is_file() {
+        } else if ft.is_file() || ft.is_symlink() {
             let rel = path
                 .strip_prefix(canon_root)
                 .map_err(|e| MdeError::new("ERR_IO", format!("strip_prefix failed: {e}")))?

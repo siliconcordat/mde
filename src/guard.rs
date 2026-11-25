@@ -530,7 +530,9 @@ pub fn audit_code_paths(paths: &[String]) -> MdeResult<GuardReport> {
 fn collect_auditable_files(dir: &Path, out: &mut Vec<String>) -> MdeResult<()> {
     let entries = fs::read_dir(dir)
         .map_err(|e| MdeError::new("ERR_IO", format!("read_dir failed: {e}")))?;
-    for entry in entries.flatten() {
+    for entry_res in entries {
+        let entry = entry_res
+            .map_err(|e| MdeError::new("ERR_IO", format!("read_dir entry failed: {e}")))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if matches!(
             name.as_str(),
@@ -539,9 +541,12 @@ fn collect_auditable_files(dir: &Path, out: &mut Vec<String>) -> MdeResult<()> {
             continue;
         }
         let path = entry.path();
-        if path.is_dir() {
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| MdeError::new("ERR_IO", format!("metadata failed: {e}")))?;
+        let ft = meta.file_type();
+        if ft.is_dir() {
             collect_auditable_files(&path, out)?;
-        } else if path.is_file() {
+        } else if ft.is_file() {
             let ext = path
                 .extension()
                 .and_then(|s| s.to_str())
@@ -647,21 +652,31 @@ fn is_silent_swallow_block(block: Node) -> bool {
     saw_stmt
 }
 
+/// Maximum JSON container nesting depth permitted by `JsonDupParser` (128 nested containers; rejects depth >= 129).
+pub const MAX_JSON_DUP_DEPTH: usize = 128;
+
 /// Strict recursive-descent JSON parser checking for duplicate object keys at any nesting depth.
 pub fn audit_json_duplicate_keys(name: &str, input: &str, findings: &mut Vec<GuardFinding>) {
     let mut p = JsonDupParser {
         bytes: input.as_bytes(),
         pos: 0,
+        depth: 0,
+        depth_exceeded: false,
         path: name,
         findings,
     };
     p.skip_ws();
     if p.parse_value().is_err() {
+        let message = if p.depth_exceeded {
+            format!("JSON nesting depth exceeds maximum ({MAX_JSON_DUP_DEPTH})")
+        } else {
+            "malformed JSON syntax".to_string()
+        };
         p.findings.push(GuardFinding {
             path: name.to_string(),
             line: byte_offset_to_line(input, p.pos),
             rule: "invalid_json".to_string(),
-            message: "malformed JSON syntax".to_string(),
+            message,
         });
         return;
     }
@@ -679,6 +694,8 @@ pub fn audit_json_duplicate_keys(name: &str, input: &str, findings: &mut Vec<Gua
 struct JsonDupParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
+    depth_exceeded: bool,
     path: &'a str,
     findings: &'a mut Vec<GuardFinding>,
 }
@@ -728,6 +745,17 @@ impl<'a> JsonDupParser<'a> {
     }
 
     fn parse_object(&mut self) -> Result<(), ()> {
+        if self.depth >= MAX_JSON_DUP_DEPTH {
+            self.depth_exceeded = true;
+            return Err(());
+        }
+        self.depth += 1;
+        let res = self.parse_object_inner();
+        self.depth -= 1;
+        res
+    }
+
+    fn parse_object_inner(&mut self) -> Result<(), ()> {
         self.pos += 1; // '{'
         self.skip_ws();
         if self.peek() == Some(b'}') {
@@ -768,6 +796,17 @@ impl<'a> JsonDupParser<'a> {
     }
 
     fn parse_array(&mut self) -> Result<(), ()> {
+        if self.depth >= MAX_JSON_DUP_DEPTH {
+            self.depth_exceeded = true;
+            return Err(());
+        }
+        self.depth += 1;
+        let res = self.parse_array_inner();
+        self.depth -= 1;
+        res
+    }
+
+    fn parse_array_inner(&mut self) -> Result<(), ()> {
         self.pos += 1; // '['
         self.skip_ws();
         if self.peek() == Some(b']') {

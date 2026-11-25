@@ -1,5 +1,4 @@
 /target
-/Cargo.lock
 .mde/tmp/
 .mde/worktrees/
 .mde/session_tokens.json
